@@ -29,12 +29,35 @@ MSG_WIND = 6
 WIND_OP_OFF = 0
 WIND_OP_ON = 1
 WIND_OP_QUERY = 2
+# Fire (UE <-> manager). WORLD-level like wind: header ids are 0, 0 and
+# ignored; the fire is addressed by fire_id (u8, 0-255, one range shared by
+# UE and the manager like vehicle ids). Coordinates are the Gazebo world
+# frame (meters, right-handed), little-endian float32.
+#   MSG_FIRE_IGNITE (both ways, 20 B): fire_id + x, y, z, radius.
+#       UE -> manager: start a fire; ignored if fire_id is already alive.
+#       The fire's first MSG_FIRE_STATE is the confirmation.
+#   MSG_FIRE_STATE (manager -> UE): fire_id, part_count(u8), then per part
+#       vertex_count(u16) + vertex_count * (x, y, z, flame_len). Polygons in
+#       boundary order, either winding, no repeated first vertex. One
+#       datagram per fire, at most MAX_FIRE_STATE_BYTES.
+#   MSG_FIRE_REMOVE (both ways, 4 B): fire_id.
+#       UE -> manager: extinguish. manager -> UE: the fire is gone (the
+#       answer to an extinguish, also sent for an id that was not alive).
+MSG_FIRE_IGNITE = 7
+MSG_FIRE_STATE = 8
+MSG_FIRE_REMOVE = 9
+# Keep a state packet inside one Ethernet MTU so it never fragments:
+# 5 B + 2 B + 16 B * 87 = 1399 B for a single-part fire.
+MAX_FIRE_STATE_BYTES = 1400
 
 # Pose payload: 7 little-endian float32 = pos(x, y, z) + quat(x, y, z, w),
 # expressed in the Gazebo frame (meters, right-handed).
 _POSE = struct.Struct('<7f')
 # Wind payload: enable(u8) + velocity(x, y, z) as float32.
 _WIND = struct.Struct('<B3f')
+# Fire ignite payload: fire_id(u8) + position(x, y, z) + radius, float32.
+_FIRE_IGNITE = struct.Struct('<B4f')
+_FIRE_VERTEX = struct.Struct('<4f')
 
 SpawnCommand = namedtuple(
     'SpawnCommand', ['entity_id', 'type_code', 'position', 'quaternion'])
@@ -45,13 +68,17 @@ DespawnCommand = namedtuple('DespawnCommand', ['entity_id', 'type_code'])
 WindCommand = namedtuple('WindCommand', ['enable', 'velocity'])
 # "Tell me the current world wind" - answered with a MSG_WIND packet.
 WindQuery = namedtuple('WindQuery', [])
+# Fire commands carry fire_id, never entity_id/type_code, for the same reason.
+FireIgnite = namedtuple('FireIgnite', ['fire_id', 'position', 'radius'])
+FireExtinguish = namedtuple('FireExtinguish', ['fire_id'])
 
 
 def parse_packet(data: bytes):
     """Parse a wire packet into a command.
 
     Returns a SpawnCommand (MessageID=1), a DespawnCommand (MessageID=4), a
-    WindCommand or WindQuery (MessageID=6), or None for other message ids.
+    WindCommand or WindQuery (MessageID=6), a FireIgnite (MessageID=7), a
+    FireExtinguish (MessageID=9), or None for other message ids.
     Raises ValueError on a malformed packet.
     """
     if len(data) < HEADER_SIZE:
@@ -84,6 +111,19 @@ def parse_packet(data: bytes):
         if not all(math.isfinite(v) for v in (vx, vy, vz)):
             raise ValueError("MessageID=6 wind velocity is not finite")
         return WindCommand(True, (vx, vy, vz))
+    if message_id == MSG_FIRE_IGNITE:
+        payload = data[HEADER_SIZE:]
+        if len(payload) < _FIRE_IGNITE.size:
+            raise ValueError("MessageID=7 payload too short for fire ignite")
+        fire_id, x, y, z, radius = _FIRE_IGNITE.unpack(
+            payload[:_FIRE_IGNITE.size])
+        if not all(math.isfinite(v) for v in (x, y, z, radius)) or radius < 0:
+            raise ValueError("MessageID=7 position/radius not finite or negative")
+        return FireIgnite(fire_id, (x, y, z), radius)
+    if message_id == MSG_FIRE_REMOVE:
+        if len(data) < HEADER_SIZE + 1:
+            raise ValueError("MessageID=9 payload too short for fire_id")
+        return FireExtinguish(data[HEADER_SIZE])
     return None
 
 
@@ -110,27 +150,61 @@ def pack_wind_query() -> bytes:
     return bytes([0, 0, MSG_WIND]) + _WIND.pack(WIND_OP_QUERY, 0.0, 0.0, 0.0)
 
 
+def pack_fire_ignite(fire_id, position, radius) -> bytes:
+    """Build a MessageID=7 ignite packet (same layout both ways)."""
+    return bytes([0, 0, MSG_FIRE_IGNITE]) + _FIRE_IGNITE.pack(
+        fire_id, *position, radius)
+
+
+def pack_fire_state(fire_id, polygons) -> bytes:
+    """Build a MessageID=8 state packet.
+
+    polygons: list of parts, each a list of (x, y, z, flame_len) vertices.
+    Raises ValueError when the packet would exceed MAX_FIRE_STATE_BYTES -
+    the caller must simplify the fire line first.
+    """
+    out = bytearray([0, 0, MSG_FIRE_STATE, fire_id, len(polygons)])
+    for part in polygons:
+        out += struct.pack('<H', len(part))
+        for vertex in part:
+            out += _FIRE_VERTEX.pack(*vertex)
+    if len(out) > MAX_FIRE_STATE_BYTES:
+        raise ValueError(
+            f"fire state packet {len(out)} B exceeds {MAX_FIRE_STATE_BYTES} B")
+    return bytes(out)
+
+
+def pack_fire_remove(fire_id) -> bytes:
+    """Build a MessageID=9 extinguish/removed packet (same layout both ways)."""
+    return bytes([0, 0, MSG_FIRE_REMOVE, fire_id])
+
+
 def triage_batch(items):
     """Classify one receive batch of (command, sender_ip) pairs.
 
-    Returns (wind, askers, rest):
+    Returns (wind, askers, fires, rest):
       wind   - the NEWEST WindCommand, or None. A world-level setting is
                idempotent, so earlier ones in the same batch are superseded.
       askers - sender IPs that sent a WindQuery, deduplicated, arrival order.
+      fires  - (FireIgnite | FireExtinguish, sender_ip) in arrival order;
+               not collapsed, an ignite then an extinguish both matter.
       rest   - the entity commands in arrival order, for the entity
                supersede/dispatch logic, which keys on entity_id/type_code
-               that the wind messages deliberately do not have.
+               that the world-level messages deliberately do not have.
     None commands (packets the manager does not act on) are skipped.
     """
     wind = None
     askers = []
+    fires = []
     rest = []
     for cmd, sender_ip in items:
         if isinstance(cmd, WindCommand):
             wind = cmd
+        elif isinstance(cmd, (FireIgnite, FireExtinguish)):
+            fires.append((cmd, sender_ip))
         elif isinstance(cmd, WindQuery):
             if sender_ip not in askers:
                 askers.append(sender_ip)
         elif cmd is not None:
             rest.append(cmd)
-    return wind, askers, rest
+    return wind, askers, fires, rest

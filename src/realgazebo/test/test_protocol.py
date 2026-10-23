@@ -3,7 +3,9 @@ import struct
 import pytest
 from realgazebo.protocol import (
     parse_packet, pack_pose, pack_destroy, pack_wind, pack_wind_query,
-    triage_batch, SpawnCommand, DespawnCommand, WindCommand, WindQuery)
+    triage_batch, SpawnCommand, DespawnCommand, WindCommand, WindQuery,
+    pack_fire_ignite, pack_fire_state, pack_fire_remove,
+    FireIgnite, FireExtinguish, MAX_FIRE_STATE_BYTES)
 
 
 def test_roundtrip_pose():
@@ -112,7 +114,7 @@ def test_wind_non_finite_velocity_rejected(bad):
 
 
 def test_unknown_message_id_returns_none():
-    assert parse_packet(bytes([0, 0, 7]) + b'\x00' * 13) is None
+    assert parse_packet(bytes([0, 0, 10]) + b'\x00' * 13) is None
 
 
 def test_triage_batch_keeps_newest_wind_and_entity_order():
@@ -120,7 +122,7 @@ def test_triage_batch_keeps_newest_wind_and_entity_order():
     wind_1 = parse_packet(pack_wind(True, (1.0, 0.0, 0.0)))
     kill_b = parse_packet(pack_destroy(1, 0))
     wind_2 = parse_packet(pack_wind(False, (0.0, 0.0, 0.0)))
-    wind, askers, rest = triage_batch([
+    wind, askers, fires, rest = triage_batch([
         (pose_a, '10.0.0.1'), (wind_1, '10.0.0.1'),
         (kill_b, '10.0.0.1'), (wind_2, '10.0.0.1')])
     assert wind == wind_2  # newest world setting wins
@@ -131,8 +133,8 @@ def test_triage_batch_keeps_newest_wind_and_entity_order():
 def test_triage_batch_collects_askers_once_each_in_order():
     query = parse_packet(pack_wind_query())
     pose_a = parse_packet(pack_pose(0, 0, (1, 2, 3), (0, 0, 0, 1)))
-    unknown = parse_packet(bytes([0, 0, 7]) + b'\x00' * 13)  # -> None
-    wind, askers, rest = triage_batch([
+    unknown = parse_packet(bytes([0, 0, 10]) + b'\x00' * 13)  # -> None
+    wind, askers, fires, rest = triage_batch([
         (query, '10.0.0.2'), (pose_a, '10.0.0.1'), (unknown, '10.0.0.9'),
         (query, '10.0.0.1'), (query, '10.0.0.2')])
     assert wind is None
@@ -141,4 +143,67 @@ def test_triage_batch_collects_askers_once_each_in_order():
 
 
 def test_triage_batch_empty():
-    assert triage_batch([]) == (None, [], [])
+    assert triage_batch([]) == (None, [], [], [])
+
+
+def test_fire_ignite_golden_vector():
+    pkt = pack_fire_ignite(5, (10.0, -2.5, 0.5), 3.0)
+    assert pkt == bytes([0, 0, 7, 5]) + struct.pack('<4f', 10.0, -2.5, 0.5, 3.0)
+    assert len(pkt) == 20
+    assert parse_packet(pkt) == FireIgnite(5, (10.0, -2.5, 0.5), 3.0)
+
+
+def test_fire_remove_golden_vector():
+    pkt = pack_fire_remove(200)
+    assert pkt == bytes([0, 0, 9, 200])
+    assert parse_packet(pkt) == FireExtinguish(200)
+
+
+def test_fire_ignite_payload_too_short_raises():
+    with pytest.raises(ValueError):
+        parse_packet(bytes([0, 0, 7, 1]) + b'\x00' * 8)
+
+
+@pytest.mark.parametrize('pos, radius', [
+    ((float('nan'), 0.0, 0.0), 1.0),
+    ((0.0, 0.0, 0.0), float('inf')),
+    ((0.0, 0.0, 0.0), -1.0),
+])
+def test_fire_ignite_bad_values_rejected(pos, radius):
+    with pytest.raises(ValueError):
+        parse_packet(pack_fire_ignite(1, pos, radius))
+
+
+def test_fire_state_layout():
+    # two square parts, as on the protocol page example
+    a = [(10, 5, 0, 2.0), (14, 5, 0, 2.5), (14, 9, 0, 3.0), (10, 9, 0, 2.0)]
+    b = [(20, 5, 0.5, 1.5), (23, 5, 0.5, 1.5), (23, 8, 0.5, 4.0), (20, 8, 0.5, 1.5)]
+    pkt = pack_fire_state(5, [a, b])
+    assert len(pkt) == 137
+    assert pkt[:5] == bytes([0, 0, 8, 5, 2])
+    assert pkt[5:7] == struct.pack('<H', 4)
+    assert pkt[7:23] == struct.pack('<4f', 10, 5, 0, 2.0)
+    assert pkt[71:73] == struct.pack('<H', 4)
+
+
+def test_fire_state_size_limit():
+    vertex = (0.0, 0.0, 0.0, 1.0)
+    fits = (MAX_FIRE_STATE_BYTES - 7) // 16
+    assert len(pack_fire_state(1, [[vertex] * fits])) <= MAX_FIRE_STATE_BYTES
+    with pytest.raises(ValueError):
+        pack_fire_state(1, [[vertex] * (fits + 1)])
+
+
+def test_fire_state_is_not_an_inbound_command():
+    assert parse_packet(pack_fire_state(1, [[(0, 0, 0, 1)]])) is None
+
+
+def test_triage_batch_routes_fire_commands_in_order():
+    ignite = parse_packet(pack_fire_ignite(0, (1.0, 2.0, 0.0), 3.0))
+    kill = parse_packet(pack_fire_remove(0))
+    pose_a = parse_packet(pack_pose(0, 0, (1, 2, 3), (0, 0, 0, 1)))
+    wind, askers, fires, rest = triage_batch([
+        (ignite, '10.0.0.1'), (pose_a, '10.0.0.1'), (kill, '10.0.0.2')])
+    # header 0,0 must not read as x500_0: fires never reach the entity path
+    assert rest == [pose_a]
+    assert fires == [(ignite, '10.0.0.1'), (kill, '10.0.0.2')]

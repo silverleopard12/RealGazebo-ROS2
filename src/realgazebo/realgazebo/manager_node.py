@@ -16,14 +16,19 @@ from .spawn_core import (
 from .backends import make_backend, HitlBackend, PilsBackend
 from .entity import Entity
 from .registry import EntityRegistry
-from .protocol import parse_packet, pack_wind, triage_batch, DespawnCommand
+from .protocol import (
+    parse_packet, pack_wind, pack_fire_state, pack_fire_remove, triage_batch,
+    DespawnCommand, FireIgnite)
 from .wind import WindPublisher
+from .fire import FireModel
 from .type_codes import scan_type_codes, type_for_code
 from .geometry import quat_to_euler
 
 SPAWN_STAGGER_SEC = 0.5
 # bounded wait for the WindEffects subscriber after advertising the wind topic
 WIND_SUBSCRIBER_WAIT_SEC = 2.0
+# fire spread step and MSG_FIRE_STATE stream period (2 Hz)
+FIRE_TICK_SEC = 0.5
 
 
 class ManagerNode(Node):
@@ -81,13 +86,23 @@ class ManagerNode(Node):
         # Last wind pushed to gz (enable, (vx, vy, vz)); the manager is the
         # only writer, so this IS the world's current wind. Answers queries.
         self._wind_state = (False, (0.0, 0.0, 0.0))
+        # Fires (MSG 7/8/9). Touched by the UDP thread (ignite/extinguish)
+        # and the fire timer (spread + state stream), hence the lock.
+        self._fires = FireModel()
+        self._fire_lock = threading.Lock()
+        # Where state packets go: the last UE that sent a fire command,
+        # falling back to the unreal_ip parameter for sim-started fires.
+        self._fire_target_ip = None
+        self._sim_time = 0.0  # seconds, from /clock: spread follows pause / RTF
         self.create_subscription(Clock, '/clock', self._on_clock, 10)
+        self.create_timer(FIRE_TICK_SEC, self._fire_tick)
         # watch spawned vehicles so a crashed PX4/container frees its slot
         self.create_timer(5.0, self._check_vehicles)
 
     # -- startup ----------------------------------------------------------
-    def _on_clock(self, _msg):
+    def _on_clock(self, msg):
         self._clock_seen = True
+        self._sim_time = msg.clock.sec + msg.clock.nanosec * 1e-9
 
     def wait_for_clock(self, timeout_sec=60.0):
         """Block until Gazebo publishes /clock (i.e. the simulator is ready)."""
@@ -344,11 +359,13 @@ class ManagerNode(Node):
             # newest wind goes first (instant, while a spawn below can block
             # for seconds); queries are answered after it, so the reply
             # reflects this batch.
-            wind, askers, cmds = triage_batch(parsed)
+            wind, askers, fires, cmds = triage_batch(parsed)
             if wind is not None:
                 self._handle_wind(wind)
             for ip in askers:
                 self._reply_wind_state(ip)
+            for fire_cmd, ip in fires:
+                self._handle_fire(fire_cmd, ip)
             for idx, cmd in enumerate(cmds):
                 if not isinstance(cmd, DespawnCommand) and any(
                         not isinstance(later, DespawnCommand)
@@ -409,6 +426,59 @@ class ManagerNode(Node):
         vx, vy, vz = velocity
         state = f"({vx:.2f}, {vy:.2f}, {vz:.2f}) m/s" if enable else "off"
         self.get_logger().info(f"wind state {state} -> {ip}:{port}")
+
+    def _handle_fire(self, cmd, ip):
+        """Ignite / extinguish a fire (runs on the UDP listener thread)."""
+        port = self.get_parameter('unreal_port').value
+        with self._fire_lock:
+            self._fire_target_ip = ip
+            if isinstance(cmd, FireIgnite):
+                started = self._fires.ignite(
+                    cmd.fire_id, cmd.position, cmd.radius, self._sim_time)
+            else:
+                self._fires.extinguish(cmd.fire_id)
+        if isinstance(cmd, FireIgnite):
+            x, y, z = cmd.position
+            if started:
+                self.get_logger().info(
+                    f"fire {cmd.fire_id} ignited at ({x:.1f}, {y:.1f}, {z:.1f}) "
+                    f"r={cmd.radius:.1f} m")
+            else:
+                self.get_logger().warn(
+                    f"fire {cmd.fire_id} ignite ignored: id already burning")
+            return
+        # Always answer, even for an id that was not alive: UE waits for it.
+        # Under the lock so it cannot overtake a state packet being sent.
+        with self._fire_lock:
+            try:
+                self._sock.sendto(pack_fire_remove(cmd.fire_id), (ip, port))
+            except OSError as exc:
+                self.get_logger().warn(
+                    f"fire {cmd.fire_id} removed reply failed: {exc}")
+        self.get_logger().info(f"fire {cmd.fire_id} extinguished")
+
+    def _fire_tick(self):
+        """Spread every fire and stream its MSG_FIRE_STATE (ROS timer thread)."""
+        if self._sock is None:
+            return
+        enable, (vx, vy, _) = self._wind_state
+        port = self.get_parameter('unreal_port').value
+        # Send while holding the lock: an extinguish handled in between would
+        # otherwise answer MSG 9 first and let this tick's stale MSG 8 for the
+        # same fire reach UE afterwards, bringing a removed fire back.
+        with self._fire_lock:
+            if not self._fires.ids():
+                return
+            self._fires.step(self._sim_time, (vx, vy) if enable else (0.0, 0.0))
+            ip = self._fire_target_ip or self.get_parameter('unreal_ip').value
+            for fid in self._fires.ids():
+                try:
+                    self._sock.sendto(
+                        pack_fire_state(fid, self._fires.polygons(fid)), (ip, port))
+                except OSError as exc:
+                    self.get_logger().warn(
+                        f"fire state to {ip}:{port} failed: {exc}")
+                    return
 
     def _handle_command(self, cmd, world, default_px4):
         """Act on one parsed wire command (runs on the UDP listener thread)."""
