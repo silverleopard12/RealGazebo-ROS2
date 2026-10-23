@@ -84,3 +84,13 @@ def test_free_id_is_the_smallest_unused():
     for i in range(MAX_FIRE_ID + 1):
         model.ignite(i, (0.0, 0.0, 0.0), 1.0, now=0.0)
     assert model.free_id() is None
+
+
+def test_fire_burns_out_after_its_duration():
+    model = FireModel()
+    model.ignite(1, (0.0, 0.0, 0.0), 1.0, now=10.0, duration=30.0)
+    model.ignite(2, (0.0, 0.0, 0.0), 1.0, now=10.0)  # no duration
+    assert model.step(39.5, (0.0, 0.0)) == []
+    assert model.step(40.0, (0.0, 0.0)) == [1]
+    assert model.ids() == [2]
+    assert model.step(1000.0, (0.0, 0.0)) == []

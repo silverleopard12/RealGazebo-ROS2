@@ -33,9 +33,11 @@ WIND_OP_QUERY = 2
 # ignored; the fire is addressed by fire_id (u8, 0-255, one range shared by
 # UE and the manager like vehicle ids). Coordinates are the Gazebo world
 # frame (meters, right-handed), little-endian float32.
-#   MSG_FIRE_IGNITE (both ways, 20 B): fire_id + x, y, z, radius.
+#   MSG_FIRE_IGNITE (both ways, 24 B): fire_id + x, y, z, radius, duration.
 #       UE -> manager: start a fire; ignored if fire_id is already alive.
-#       The fire's first MSG_FIRE_STATE is the confirmation.
+#       The fire's first MSG_FIRE_STATE is the confirmation. duration is
+#       seconds of sim time until the manager puts the fire out itself
+#       (sending MSG_FIRE_REMOVE); 0 burns until extinguished.
 #   MSG_FIRE_STATE (manager -> UE): fire_id, part_count(u8), then per part
 #       vertex_count(u16) + vertex_count * (x, y, z, flame_len). Polygons in
 #       boundary order, either winding, no repeated first vertex. One
@@ -55,8 +57,9 @@ MAX_FIRE_STATE_BYTES = 1400
 _POSE = struct.Struct('<7f')
 # Wind payload: enable(u8) + velocity(x, y, z) as float32.
 _WIND = struct.Struct('<B3f')
-# Fire ignite payload: fire_id(u8) + position(x, y, z) + radius, float32.
-_FIRE_IGNITE = struct.Struct('<B4f')
+# Fire ignite payload: fire_id(u8) + position(x, y, z) + radius + duration,
+# float32.
+_FIRE_IGNITE = struct.Struct('<B5f')
 _FIRE_VERTEX = struct.Struct('<4f')
 
 SpawnCommand = namedtuple(
@@ -69,7 +72,8 @@ WindCommand = namedtuple('WindCommand', ['enable', 'velocity'])
 # "Tell me the current world wind" - answered with a MSG_WIND packet.
 WindQuery = namedtuple('WindQuery', [])
 # Fire commands carry fire_id, never entity_id/type_code, for the same reason.
-FireIgnite = namedtuple('FireIgnite', ['fire_id', 'position', 'radius'])
+FireIgnite = namedtuple(
+    'FireIgnite', ['fire_id', 'position', 'radius', 'duration'])
 FireExtinguish = namedtuple('FireExtinguish', ['fire_id'])
 
 
@@ -115,11 +119,13 @@ def parse_packet(data: bytes):
         payload = data[HEADER_SIZE:]
         if len(payload) < _FIRE_IGNITE.size:
             raise ValueError("MessageID=7 payload too short for fire ignite")
-        fire_id, x, y, z, radius = _FIRE_IGNITE.unpack(
+        fire_id, x, y, z, radius, duration = _FIRE_IGNITE.unpack(
             payload[:_FIRE_IGNITE.size])
-        if not all(math.isfinite(v) for v in (x, y, z, radius)) or radius < 0:
-            raise ValueError("MessageID=7 position/radius not finite or negative")
-        return FireIgnite(fire_id, (x, y, z), radius)
+        if (not all(math.isfinite(v) for v in (x, y, z, radius, duration))
+                or radius < 0 or duration < 0):
+            raise ValueError(
+                "MessageID=7 position/radius/duration not finite or negative")
+        return FireIgnite(fire_id, (x, y, z), radius, duration)
     if message_id == MSG_FIRE_REMOVE:
         if len(data) < HEADER_SIZE + 1:
             raise ValueError("MessageID=9 payload too short for fire_id")
@@ -150,10 +156,10 @@ def pack_wind_query() -> bytes:
     return bytes([0, 0, MSG_WIND]) + _WIND.pack(WIND_OP_QUERY, 0.0, 0.0, 0.0)
 
 
-def pack_fire_ignite(fire_id, position, radius) -> bytes:
+def pack_fire_ignite(fire_id, position, radius, duration=0.0) -> bytes:
     """Build a MessageID=7 ignite packet (same layout both ways)."""
     return bytes([0, 0, MSG_FIRE_IGNITE]) + _FIRE_IGNITE.pack(
-        fire_id, *position, radius)
+        fire_id, *position, radius, duration)
 
 
 def pack_fire_state(fire_id, polygons) -> bytes:

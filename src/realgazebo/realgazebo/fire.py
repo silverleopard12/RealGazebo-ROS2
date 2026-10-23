@@ -4,7 +4,8 @@ Pure Python (no ROS / gz) so it unit-tests like protocol.py. A fire is a
 star-shaped polygon: RAY_COUNT rays from the ignition point. Only the wind
 moves it: each ray grows with the wind component blowing along it and burns
 taller there, so the fire line stretches downwind. With no wind the fire
-keeps its ignition ring. Times are simulation seconds.
+keeps its ignition ring. A fire with a duration burns out on its own. Times
+are simulation seconds.
 """
 import math
 
@@ -22,8 +23,9 @@ _DIRS = [(math.cos(2 * math.pi * i / RAY_COUNT),
 
 
 class _Fire:
-    def __init__(self, position, radius, now):
+    def __init__(self, position, radius, now, duration):
         self.center = position
+        self.burns_out_at = now + duration if duration > 0 else None
         self.radii = [max(radius, MIN_RADIUS)] * RAY_COUNT
         self.flames = [BASE_FLAME] * RAY_COUNT
         self.last_t = now
@@ -41,11 +43,15 @@ class FireModel:
         return next(
             (i for i in range(MAX_FIRE_ID + 1) if i not in self._fires), None)
 
-    def ignite(self, fire_id, position, radius, now) -> bool:
-        """Start a fire. False (nothing changes) if fire_id is already alive."""
+    def ignite(self, fire_id, position, radius, now, duration=0.0) -> bool:
+        """Start a fire. False (nothing changes) if fire_id is already alive.
+
+        duration > 0 burns it out that many seconds after `now`; 0 burns
+        until extinguished.
+        """
         if fire_id in self._fires:
             return False
-        self._fires[fire_id] = _Fire(position, radius, now)
+        self._fires[fire_id] = _Fire(position, radius, now, duration)
         return True
 
     def extinguish(self, fire_id) -> bool:
@@ -55,8 +61,14 @@ class FireModel:
     def step(self, now, wind_xy):
         """Advance every fire to `now` under the horizontal wind (m/s).
 
+        Removes the fires whose duration ran out and returns their ids.
         Time going backwards (sim reset) moves nothing.
         """
+        burnt_out = [fid for fid, fire in self._fires.items()
+                     if fire.burns_out_at is not None
+                     and now >= fire.burns_out_at]
+        for fid in burnt_out:
+            del self._fires[fid]
         wx, wy = wind_xy
         for fire in self._fires.values():
             dt = max(0.0, now - fire.last_t)
@@ -65,6 +77,7 @@ class FireModel:
                 along = max(0.0, wx * dx + wy * dy)
                 fire.radii[i] += WIND_SPREAD * along * dt
                 fire.flames[i] = BASE_FLAME + WIND_FLAME * along
+        return burnt_out
 
     def polygons(self, fire_id):
         """The fire line as one part: [[(x, y, z, flame_len), ...]]."""

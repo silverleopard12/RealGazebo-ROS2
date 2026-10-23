@@ -147,10 +147,15 @@ def test_triage_batch_empty():
 
 
 def test_fire_ignite_golden_vector():
-    pkt = pack_fire_ignite(5, (10.0, -2.5, 0.5), 3.0)
-    assert pkt == bytes([0, 0, 7, 5]) + struct.pack('<4f', 10.0, -2.5, 0.5, 3.0)
-    assert len(pkt) == 20
-    assert parse_packet(pkt) == FireIgnite(5, (10.0, -2.5, 0.5), 3.0)
+    pkt = pack_fire_ignite(5, (10.0, -2.5, 0.5), 3.0, 60.0)
+    assert pkt == bytes([0, 0, 7, 5]) + struct.pack(
+        '<5f', 10.0, -2.5, 0.5, 3.0, 60.0)
+    assert len(pkt) == 24
+    assert parse_packet(pkt) == FireIgnite(5, (10.0, -2.5, 0.5), 3.0, 60.0)
+
+
+def test_fire_ignite_without_duration_burns_until_extinguished():
+    assert parse_packet(pack_fire_ignite(5, (0.0, 0.0, 0.0), 1.0)).duration == 0.0
 
 
 def test_fire_remove_golden_vector():
@@ -164,14 +169,16 @@ def test_fire_ignite_payload_too_short_raises():
         parse_packet(bytes([0, 0, 7, 1]) + b'\x00' * 8)
 
 
-@pytest.mark.parametrize('pos, radius', [
-    ((float('nan'), 0.0, 0.0), 1.0),
-    ((0.0, 0.0, 0.0), float('inf')),
-    ((0.0, 0.0, 0.0), -1.0),
+@pytest.mark.parametrize('pos, radius, duration', [
+    ((float('nan'), 0.0, 0.0), 1.0, 0.0),
+    ((0.0, 0.0, 0.0), float('inf'), 0.0),
+    ((0.0, 0.0, 0.0), -1.0, 0.0),
+    ((0.0, 0.0, 0.0), 1.0, float('nan')),
+    ((0.0, 0.0, 0.0), 1.0, -1.0),
 ])
-def test_fire_ignite_bad_values_rejected(pos, radius):
+def test_fire_ignite_bad_values_rejected(pos, radius, duration):
     with pytest.raises(ValueError):
-        parse_packet(pack_fire_ignite(1, pos, radius))
+        parse_packet(pack_fire_ignite(1, pos, radius, duration))
 
 
 def test_fire_state_layout():

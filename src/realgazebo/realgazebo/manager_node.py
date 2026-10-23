@@ -52,6 +52,8 @@ class ManagerNode(Node):
         self.declare_parameter('mavlink_gcs_ip', '172.17.0.1')
         # ignition radius (m) for fires started from the ignite topic
         self.declare_parameter('fire_default_radius', 1.0)
+        # burn time (s) for topic fires; 0 burns until extinguished
+        self.declare_parameter('fire_default_duration', 0.0)
         self.registry = EntityRegistry()
         # code->type map scanned from the model templates (single source of
         # truth shared with the gz plugin's <type_code> SDF element)
@@ -443,7 +445,8 @@ class ManagerNode(Node):
             self._fire_target_ip = ip
             if isinstance(cmd, FireIgnite):
                 started = self._fires.ignite(
-                    cmd.fire_id, cmd.position, cmd.radius, self._sim_time)
+                    cmd.fire_id, cmd.position, cmd.radius, self._sim_time,
+                    cmd.duration)
             else:
                 self._fires.extinguish(cmd.fire_id)
         if isinstance(cmd, FireIgnite):
@@ -451,7 +454,7 @@ class ManagerNode(Node):
             if started:
                 self.get_logger().info(
                     f"fire {cmd.fire_id} ignited at ({x:.1f}, {y:.1f}, {z:.1f}) "
-                    f"r={cmd.radius:.1f} m")
+                    f"r={cmd.radius:.1f} m duration={cmd.duration:.0f} s")
             else:
                 self.get_logger().warn(
                     f"fire {cmd.fire_id} ignite ignored: id already burning")
@@ -477,16 +480,18 @@ class ManagerNode(Node):
         """Start a fire from the sim side; UE learns of it from its state."""
         p = msg.point
         radius = self.get_parameter('fire_default_radius').value
+        duration = self.get_parameter('fire_default_duration').value
         with self._fire_lock:
             fid = self._fires.free_id()
             if fid is not None:
-                self._fires.ignite(fid, (p.x, p.y, p.z), radius, self._sim_time)
+                self._fires.ignite(
+                    fid, (p.x, p.y, p.z), radius, self._sim_time, duration)
         if fid is None:
             self.get_logger().warn("fire ignite ignored: all fire ids in use")
             return
         self.get_logger().info(
             f"fire {fid} ignited from topic at ({p.x:.1f}, {p.y:.1f}, {p.z:.1f}) "
-            f"r={radius:.1f} m")
+            f"r={radius:.1f} m duration={duration:.0f} s")
 
     def _on_fire_extinguish(self, msg):
         """Put a fire out from the sim side and tell UE."""
@@ -500,7 +505,8 @@ class ManagerNode(Node):
         self.get_logger().info(f"fire {msg.data} extinguished from topic")
 
     def _fire_tick(self):
-        """Spread every fire and stream its MSG_FIRE_STATE (ROS timer thread)."""
+        """Spread every fire, burn out the expired ones and stream the state
+        (ROS timer thread)."""
         if self._sock is None:
             return
         enable, (vx, vy, _) = self._wind_state
@@ -511,8 +517,16 @@ class ManagerNode(Node):
         with self._fire_lock:
             if not self._fires.ids():
                 return
-            self._fires.step(self._sim_time, (vx, vy) if enable else (0.0, 0.0))
+            burnt_out = self._fires.step(
+                self._sim_time, (vx, vy) if enable else (0.0, 0.0))
             ip = self._fire_target_ip or self.get_parameter('unreal_ip').value
+            for fid in burnt_out:
+                self.get_logger().info(f"fire {fid} burnt out")
+                try:
+                    self._sock.sendto(pack_fire_remove(fid), (ip, port))
+                except OSError as exc:
+                    self.get_logger().warn(
+                        f"fire {fid} removed to {ip}:{port} failed: {exc}")
             for fid in self._fires.ids():
                 try:
                     self._sock.sendto(
