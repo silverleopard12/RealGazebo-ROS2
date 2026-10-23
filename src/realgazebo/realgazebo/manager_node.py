@@ -8,7 +8,9 @@ import yaml
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
+from geometry_msgs.msg import PointStamped
 from rosgraph_msgs.msg import Clock
+from std_msgs.msg import UInt8
 
 from .yaml_config import parse_vehicles, VehicleSpec
 from .spawn_core import (
@@ -48,6 +50,8 @@ class ManagerNode(Node):
         self.declare_parameter('docker_gazebo_network', 'gazebo-network')
         self.declare_parameter('docker_vehicle_network', 'vehicle-network')
         self.declare_parameter('mavlink_gcs_ip', '172.17.0.1')
+        # ignition radius (m) for fires started from the ignite topic
+        self.declare_parameter('fire_default_radius', 1.0)
         self.registry = EntityRegistry()
         # code->type map scanned from the model templates (single source of
         # truth shared with the gz plugin's <type_code> SDF element)
@@ -96,6 +100,12 @@ class ManagerNode(Node):
         self._sim_time = 0.0  # seconds, from /clock: spread follows pause / RTF
         self.create_subscription(Clock, '/clock', self._on_clock, 10)
         self.create_timer(FIRE_TICK_SEC, self._fire_tick)
+        # Sim-side fires: point in Gazebo world metres (frame_id is not
+        # transformed), and a fire_id to put out.
+        self.create_subscription(
+            PointStamped, '/realgazebo/fire/ignite', self._on_fire_ignite, 10)
+        self.create_subscription(
+            UInt8, '/realgazebo/fire/extinguish', self._on_fire_extinguish, 10)
         # watch spawned vehicles so a crashed PX4/container frees its slot
         self.create_timer(5.0, self._check_vehicles)
 
@@ -429,7 +439,6 @@ class ManagerNode(Node):
 
     def _handle_fire(self, cmd, ip):
         """Ignite / extinguish a fire (runs on the UDP listener thread)."""
-        port = self.get_parameter('unreal_port').value
         with self._fire_lock:
             self._fire_target_ip = ip
             if isinstance(cmd, FireIgnite):
@@ -448,14 +457,47 @@ class ManagerNode(Node):
                     f"fire {cmd.fire_id} ignite ignored: id already burning")
             return
         # Always answer, even for an id that was not alive: UE waits for it.
-        # Under the lock so it cannot overtake a state packet being sent.
+        self._send_fire_removed(cmd.fire_id, ip)
+        self.get_logger().info(f"fire {cmd.fire_id} extinguished")
+
+    def _send_fire_removed(self, fire_id, ip):
+        """MSG_FIRE_REMOVE to UE. Under the lock so it cannot overtake a
+        state packet being sent."""
+        port = self.get_parameter('unreal_port').value
         with self._fire_lock:
+            if self._sock is None:
+                return
             try:
-                self._sock.sendto(pack_fire_remove(cmd.fire_id), (ip, port))
+                self._sock.sendto(pack_fire_remove(fire_id), (ip, port))
             except OSError as exc:
                 self.get_logger().warn(
-                    f"fire {cmd.fire_id} removed reply failed: {exc}")
-        self.get_logger().info(f"fire {cmd.fire_id} extinguished")
+                    f"fire {fire_id} removed to {ip}:{port} failed: {exc}")
+
+    def _on_fire_ignite(self, msg):
+        """Start a fire from the sim side; UE learns of it from its state."""
+        p = msg.point
+        radius = self.get_parameter('fire_default_radius').value
+        with self._fire_lock:
+            fid = self._fires.free_id()
+            if fid is not None:
+                self._fires.ignite(fid, (p.x, p.y, p.z), radius, self._sim_time)
+        if fid is None:
+            self.get_logger().warn("fire ignite ignored: all fire ids in use")
+            return
+        self.get_logger().info(
+            f"fire {fid} ignited from topic at ({p.x:.1f}, {p.y:.1f}, {p.z:.1f}) "
+            f"r={radius:.1f} m")
+
+    def _on_fire_extinguish(self, msg):
+        """Put a fire out from the sim side and tell UE."""
+        with self._fire_lock:
+            alive = self._fires.extinguish(msg.data)
+            ip = self._fire_target_ip or self.get_parameter('unreal_ip').value
+        if not alive:
+            self.get_logger().warn(f"fire {msg.data} extinguish ignored: not burning")
+            return
+        self._send_fire_removed(msg.data, ip)
+        self.get_logger().info(f"fire {msg.data} extinguished from topic")
 
     def _fire_tick(self):
         """Spread every fire and stream its MSG_FIRE_STATE (ROS timer thread)."""

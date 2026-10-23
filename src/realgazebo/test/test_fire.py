@@ -1,7 +1,7 @@
 import math
 
 from realgazebo.fire import (
-    FireModel, RAY_COUNT, MIN_RADIUS, WIND_SPREAD, BASE_FLAME)
+    FireModel, RAY_COUNT, MIN_RADIUS, WIND_SPREAD, BASE_FLAME, MAX_FIRE_ID)
 from realgazebo.protocol import pack_fire_state, MAX_FIRE_STATE_BYTES
 
 
@@ -73,3 +73,14 @@ def test_state_packet_fits_one_datagram():
     model = FireModel()
     model.ignite(1, (0.0, 0.0, 0.0), 2.0, now=0.0)
     assert len(pack_fire_state(1, model.polygons(1))) <= MAX_FIRE_STATE_BYTES
+
+
+def test_free_id_is_the_smallest_unused():
+    model = FireModel()
+    assert model.free_id() == 0
+    model.ignite(0, (0.0, 0.0, 0.0), 1.0, now=0.0)
+    model.ignite(2, (0.0, 0.0, 0.0), 1.0, now=0.0)
+    assert model.free_id() == 1
+    for i in range(MAX_FIRE_ID + 1):
+        model.ignite(i, (0.0, 0.0, 0.0), 1.0, now=0.0)
+    assert model.free_id() is None

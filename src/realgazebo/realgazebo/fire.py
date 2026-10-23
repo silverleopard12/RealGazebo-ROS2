@@ -11,6 +11,7 @@ import math
 # Fire line vertices per fire: 5 + 2 + 16 * 32 = 519 B per state packet,
 # well inside protocol.MAX_FIRE_STATE_BYTES.
 RAY_COUNT = 32
+MAX_FIRE_ID = 255   # fire_id is a u8 on the wire
 MIN_RADIUS = 0.5    # m, a zero-radius ignite still starts as a small ring
 WIND_SPREAD = 0.15  # m/s of spread per m/s of wind blowing along the ray
 BASE_FLAME = 1.0    # m
@@ -34,6 +35,11 @@ class FireModel:
 
     def ids(self):
         return sorted(self._fires)
+
+    def free_id(self):
+        """Smallest fire_id not burning, or None when all 256 are taken."""
+        return next(
+            (i for i in range(MAX_FIRE_ID + 1) if i not in self._fires), None)
 
     def ignite(self, fire_id, position, radius, now) -> bool:
         """Start a fire. False (nothing changes) if fire_id is already alive."""
