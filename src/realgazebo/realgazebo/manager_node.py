@@ -477,7 +477,9 @@ class ManagerNode(Node):
                     f"fire {fire_id} removed to {ip}:{port} failed: {exc}")
 
     def _on_fire_ignite(self, msg):
-        """Start a fire from the sim side; UE learns of it from its state."""
+        """Start a fire from the sim side; UE learns of it from its state,
+        sent at once: the next tick is up to FIRE_TICK_SEC away, so a crash's
+        fire came up to that late after the crash."""
         p = msg.point
         radius = self.get_parameter('fire_default_radius').value
         duration = self.get_parameter('fire_default_duration').value
@@ -486,6 +488,7 @@ class ManagerNode(Node):
             if fid is not None:
                 self._fires.ignite(
                     fid, (p.x, p.y, p.z), radius, self._sim_time, duration)
+                self._send_fire_state(fid)
         if fid is None:
             self.get_logger().warn("fire ignite ignored: all fire ids in use")
             return
@@ -528,13 +531,23 @@ class ManagerNode(Node):
                     self.get_logger().warn(
                         f"fire {fid} removed to {ip}:{port} failed: {exc}")
             for fid in self._fires.ids():
-                try:
-                    self._sock.sendto(
-                        pack_fire_state(fid, self._fires.polygons(fid)), (ip, port))
-                except OSError as exc:
-                    self.get_logger().warn(
-                        f"fire state to {ip}:{port} failed: {exc}")
+                if not self._send_fire_state(fid):
                     return
+
+    def _send_fire_state(self, fire_id):
+        """MSG_FIRE_STATE of one fire to UE; call it holding _fire_lock (see
+        _fire_tick). False if it was not sent: no socket yet, or a send error."""
+        if self._sock is None:
+            return False
+        ip = self._fire_target_ip or self.get_parameter('unreal_ip').value
+        port = self.get_parameter('unreal_port').value
+        try:
+            self._sock.sendto(
+                pack_fire_state(fire_id, self._fires.polygons(fire_id)), (ip, port))
+        except OSError as exc:
+            self.get_logger().warn(f"fire state to {ip}:{port} failed: {exc}")
+            return False
+        return True
 
     def _handle_command(self, cmd, world, default_px4):
         """Act on one parsed wire command (runs on the UDP listener thread)."""
